@@ -7,7 +7,9 @@
 
 `--model` is a Hugging Face repo id; it is downloaded once into ~/huggingface/<name>
 (e.g. ~/huggingface/DeepSeek-V2-Lite), which is the path the bench commands take.
-nsys is in the image: `nsys profile ... python -m bench.run ...` works as is.
+Nsight Systems is opt-in: set NSYS=1 to bake it into the image, then
+`nsys profile ... python -m bench.run ...` works. Off by default because
+NVIDIA's CUDA apt repo currently serves an unsigned InRelease (2026-11-11).
 
 Each run is killed after TIMEOUT_MIN minutes (default 20) so a hung job can't
 burn credits; raise it only for runs that really are long.
@@ -32,15 +34,29 @@ MODELS = "/root/huggingface"
 OUT = "/root/out"
 GPU = os.environ.get("GPU", "L4")
 TIMEOUT_MIN = int(os.environ.get("TIMEOUT_MIN", "20"))
+# Opt-in: see the note below. Sections 1.x only need Python timers / CUDA events.
+NSYS = os.environ.get("NSYS", "0") == "1"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("build-essential", "wget")  # triton compiles its launcher with gcc
-    .run_commands(  # Nsight Systems CLI from NVIDIA's CUDA repo, for kernel-level timelines
+)
+
+# Nsight Systems CLI from NVIDIA's CUDA repo, for kernel-level timelines.
+# 2026-11-11: that repo currently serves an unsigned InRelease, so
+# `apt-get update` fails with exit 100 and the whole image build breaks.
+# 1.1 (observation & correctness) never uses nsys, so it is disabled by
+# default. Set NSYS=1 to opt in once the repo is fixed or a later section
+# actually needs `nsys profile ...`.
+if NSYS:
+    image = image.run_commands(
         "wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb",
         "dpkg -i /tmp/cuda-keyring.deb && apt-get update && apt-get install -y --no-install-recommends nsight-systems-2026.3.2",
         "ln -sf $(ls -d /opt/nvidia/nsight-systems/*/bin/nsys | head -1) /usr/local/bin/nsys",
     )
+
+image = (
+    image
     .pip_install("torch==2.6.0", "transformers>=4.51,<5", "xxhash", "huggingface_hub", "pytest")
     .pip_install(
         "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/"

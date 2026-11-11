@@ -9,12 +9,14 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+# ModelRunner imported lazily in __init__ (pulls flash-attn / triton CUDA wheels)
+from nanovllm.engine.stats import StepRecord, RequestRecord
 
 
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        from nanovllm.engine.model_runner import ModelRunner
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -32,6 +34,9 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.step_records: list[StepRecord] = []
+        self.request_records: list[RequestRecord] = []
+        self.trace = None
         atexit.register(self.exit)
 
     def exit(self):
@@ -46,11 +51,44 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
+    def abort_request(self, seq_ids: list[int]):
+        self.scheduler.abort(seq_ids)
+
     def step(self):
+        t0 = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
+        t1 = perf_counter()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        t2 = perf_counter()
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        t3 = perf_counter()
+        finished, self.scheduler.finished = self.scheduler.finished, []
+        preempted, self.scheduler.preempted = self.scheduler.preempted, []
+        record = StepRecord(
+            is_prefill=is_prefill,
+            num_seqs=len(seqs),
+            num_tokens=abs(num_tokens),
+            wall=t3 - t0,
+            cpu_schedule=t1 - t0,
+            cpu_postprocess=t3 - t2,
+            seq_ids=[seq.seq_id for seq in seqs],
+            finished=[seq.seq_id for seq in finished],
+            preempted=preempted,
+            **self.model_runner.last_timing,
+        )
+        self.step_records.append(record)
+        for seq in finished:
+            self.request_records.append(RequestRecord(
+                seq_id=seq.seq_id,
+                num_prompt_tokens=seq.num_prompt_tokens,
+                num_output_tokens=seq.num_completion_tokens,
+                arrival_time=seq.arrival_time,
+                token_times=seq.token_times,
+                num_preemptions=seq.num_preemptions,
+            ))
+        if self.trace is not None:
+            self.trace(record)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
@@ -81,10 +119,12 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for item in output:
+                seq_id, token_ids, *rest = item
+                outputs[seq_id] = token_ids, rest[0] if rest else None
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids, "finish_reason": reason}
+                   for token_ids, reason in outputs]
         return outputs
